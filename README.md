@@ -1,22 +1,22 @@
 # R-Quran
 
-Quran reading app for Linux.
-
-## Stack
-Python + GTK4 + libadwaita + Poppler
+Simple Quran reader for Linux.
 
 ## Run
+
+AppImage:
+```
+./R-Quran-x86_64.AppImage
+```
+
+From source:
 ```
 PYTHONPATH=src python3 -m r_quran.app
 ```
 
 ## Features
-- Light, dark, sepia, high contrast
-- Single and two-page book view
-- Page navigation, Juz, Surah, bookmarks
-- Offline
-
-## Controls
-- Arrow keys, PageUp/PageDown to navigate
-- Click edges or swipe
-- `t` toggle two-page, `b` bookmark
+- Two-page book view
+- Juz, Surah, bookmarks
+- Light / dark / sepia
+- Offline, no page numbers
+- Fullscreen with F
