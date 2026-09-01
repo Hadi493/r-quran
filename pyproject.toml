@@ -1,0 +1,20 @@
+[project]
+name = "r-quran"
+version = "0.1.0"
+description = "Quran reading native app for Linux — GTK4 + Poppler"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyGObject>=3.40",
+]
+authors = [{name="r-quran"}]
+
+[project.scripts]
+r-quran = "r_quran.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
