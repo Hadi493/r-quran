@@ -4,7 +4,11 @@ Simple Quran reader for Linux.
 
 ## Demo
 
-<video src="r-quran-demo.mp4" controls width="100%"></video>
+https://github.com/Hadi493/r-quran/blob/master/r-quran-demo.mp4
+
+<video src="https://raw.githubusercontent.com/Hadi493/r-quran/master/r-quran-demo.mp4" controls width="100%" poster="r-quran.png"></video>
+
+[Download demo](r-quran-demo.mp4)
 
 ## Run
 
