@@ -2,6 +2,10 @@
 
 Simple Quran reader for Linux.
 
+## Demo
+
+<video src="r-quran-demo.mp4" controls width="100%"></video>
+
 ## Run
 
 AppImage:
