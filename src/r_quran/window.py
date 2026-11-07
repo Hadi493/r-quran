@@ -1,455 +1,592 @@
-import gi, json, os, math, cairo
-gi.require_version('Gtk', '4.0')
-gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw, Gio, Gdk, GLib
-from pathlib import Path
-from .pdf import QuranDocument
+"""Main application window and user interface controllers."""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import TYPE_CHECKING, Any
+
+import cairo
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gtk
+
 from . import bookmarks
-_DATA_CANDIDATES = [Path(__file__).resolve().parents[2] / 'data', Path(__file__).resolve().parents[2] / 'share' / 'r-quran' / 'data', Path(__file__).resolve().parents[1] / 'data', Path('/usr/share/r-quran/data')]
-DATA_DIR = next((p for p in _DATA_CANDIDATES if p.exists()), _DATA_CANDIDATES[0])
+from .config import AppSettings, load_settings, save_settings
+from .constants import (
+    APP_TITLE,
+    DATA_CANDIDATES,
+    DEFAULT_FIRST_PAGE,
+    DEFAULT_ZOOM,
+    MAX_ZOOM,
+    MIN_ZOOM,
+    PAGE_GAP,
+    ZOOM_STEP,
+)
+from .pdf import QuranDocument
+from .renderer import (
+    draw_dropshadow,
+    render_page_to_surface,
+    render_spread_surface,
+)
+from .theme import ThemeManager, is_dark_mode
 
-def load_json(name):
-    try:
-        return json.loads((DATA_DIR / name).read_text())
-    except Exception:
+if TYPE_CHECKING:
+    from pathlib import Path
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _find_data_dir() -> Path:
+    """Locate the directory containing surah and juz metadata files."""
+    for candidate in DATA_CANDIDATES:
+        if candidate.is_dir():
+            return candidate
+    return DATA_CANDIDATES[0]
+
+
+def _load_data_file(filename: str) -> list[dict[str, Any]]:
+    """Load JSON array from the data directory."""
+    path = _find_data_dir() / filename
+    if not path.is_file():
         return []
-JUZ_DATA = load_json('juz.json')
-SURAH_DATA = load_json('surah.json')
-
-def _is_dark():
     try:
-        sm = Adw.StyleManager.get_default()
-        return sm.get_dark()
-    except Exception:
-        return False
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+    except (json.JSONDecodeError, OSError) as exc:
+        _LOGGER.warning("Failed to load metadata file %s: %s", filename, exc)
+    return []
 
-def _invert_surface(surf):
-    try:
-        high = Adw.StyleManager.get_default().get_high_contrast()
-    except Exception:
-        high = False
-    cr = cairo.Context(surf)
-    cr.set_operator(cairo.Operator.DIFFERENCE)
-    if high:
-        cr.set_source_rgb(1, 1, 1)
-    else:
-        cr.set_source_rgb(0.88, 0.88, 0.88)
-    cr.paint()
-    return surf
 
-def render_page_to_surface(page, scale: float):
-    pw, ph = page.get_size()
-    w, h = (int(pw * scale), int(ph * scale))
-    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, max(1, w), max(1, h))
-    cr = cairo.Context(surf)
-    cr.scale(scale, scale)
-    cr.set_source_rgb(1, 1, 1)
-    cr.rectangle(0, 0, pw, ph)
-    cr.fill()
-    page.render(cr)
-    if _is_dark():
-        _invert_surface(surf)
-    return (surf, pw, ph)
+JUZ_DATA = _load_data_file("juz.json")
+SURAH_DATA = _load_data_file("surah.json")
+
 
 class QuranWindow(Adw.ApplicationWindow):
+    """Primary window providing reading canvas, navigation, and controls."""
 
-    def __init__(self, app, pdf_path=None):
-        super().__init__(application=app, title='R-Quran')
-        self.set_default_size(1000, 700)
+    def __init__(self, app: Adw.Application, pdf_path: str | None = None) -> None:
+        super().__init__(application=app, title=APP_TITLE)
+
+        # Load persisted user settings cache
+        self._settings: AppSettings = load_settings()
+
+        # Geometry restoration
+        self.set_default_size(self._settings.window_width, self._settings.window_height)
+        if self._settings.is_maximized:
+            self.maximize()
+
+        # Document loading
+        self.first_page = DEFAULT_FIRST_PAGE
+        self.doc: QuranDocument | None = None
+        self._error: str | None = None
         try:
             self.doc = QuranDocument(pdf_path)
-        except Exception as e:
-            self.doc = None
-            self._error = str(e)
+        except (FileNotFoundError, RuntimeError, OSError) as exc:
+            self._error = str(exc)
+
+        # Page index restoration (0-based)
+        if self.doc:
+            total_pages = self.doc.get_n_pages()
+            target_0based = self._settings.current_page - 1
+            self.current_page = max(
+                self.first_page, min(target_0based, total_pages - 1)
+            )
         else:
-            self._error = None
-        self.first_page = 1
-        self.current_page = 1
-        if self.doc and self.current_page >= self.doc.get_n_pages():
             self.current_page = self.first_page
-        self.zoom = 1.0
-        self._fit = True
-        self.two_page = True
+
+        # Viewing options restoration
+        self.zoom = max(MIN_ZOOM, min(self._settings.zoom, MAX_ZOOM))
+        self._fit = self._settings.fit_width
+        self.two_page = self._settings.two_page
         self.rtl = True
-        self._css_provider = Gtk.CssProvider()
+
+        # Theme manager
+        self.theme_manager = ThemeManager(self)
+
+        # UI Components
         self.header = Adw.HeaderBar()
+        self.prev_btn: Gtk.Button
+        self.next_btn: Gtk.Button
+        self.two_btn: Gtk.ToggleButton
+        self.theme_btn: Gtk.MenuButton
+        self.juz_btn: Gtk.MenuButton
+        self.surah_btn: Gtk.MenuButton
+        self.bm_btn: Gtk.MenuButton
+        self._bm_box: Gtk.Box
+        self._bm_pop: Gtk.Popover
+
+        self._build_header_bar()
+        self._build_content_area()
+        self._setup_event_controllers()
+
+        # Signal connections
+        self.connect("realize", self._on_realize)
+        self.connect("close-request", self._on_close_request)
+
+        # Listen for system theme toggles
+        Adw.StyleManager.get_default().connect("notify::dark", self._on_dark_changed)
+
+        self.update_ui()
+        if self._error:
+            self.status.set_label(f"Error: {self._error}")
+
+    def _build_header_bar(self) -> None:
+        """Construct the top header bar and navigation actions."""
         self.header.set_show_start_title_buttons(False)
         self.header.set_show_end_title_buttons(False)
-        self.header.set_decoration_layout('')
-        self.header.add_css_class('compact-header')
-        self.prev_btn = Gtk.Button(icon_name='go-previous-symbolic', tooltip_text='Previous (←/p)')
-        self.prev_btn.connect('clicked', lambda *_: self.go_prev())
+        self.header.set_decoration_layout("")
+        self.header.add_css_class("compact-header")
+
+        # Previous page button
+        self.prev_btn = Gtk.Button(
+            icon_name="go-previous-symbolic",
+            tooltip_text="Previous (←/p)",
+        )
+        self.prev_btn.connect("clicked", lambda *_: self.go_prev())
         self.header.pack_start(self.prev_btn)
+
+        # Navigation index buttons
+        self.juz_btn = Gtk.MenuButton(label="Juz", tooltip_text="Juz — 30 parts")
+        self.header.pack_start(self.juz_btn)
+        self._build_juz_menu()
+
+        self.surah_btn = Gtk.MenuButton(
+            label="Surah", tooltip_text="Surah — 114 chapters"
+        )
+        self.header.pack_start(self.surah_btn)
+        self._build_surah_menu()
+
+        self.bm_btn = Gtk.MenuButton(
+            icon_name="bookmark-new-symbolic",
+            tooltip_text="Bookmarks (b)",
+        )
+        self.header.pack_start(self.bm_btn)
+        self._build_bookmark_menu()
+
+        add_bm_btn = Gtk.Button(
+            icon_name="bookmark-add-symbolic",
+            tooltip_text="Add bookmark (b)",
+        )
+        add_bm_btn.add_css_class("suggested-action")
+        add_bm_btn.connect("clicked", lambda *_: self.on_add_bookmark())
+        self.header.pack_start(add_bm_btn)
+        self.header.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+
+        # Center spacer box
         nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         nav_box.set_halign(Gtk.Align.CENTER)
         self.header.set_title_widget(nav_box)
-        self.next_btn = Gtk.Button(icon_name='go-next-symbolic', tooltip_text='Next (→/n)')
-        self.next_btn.connect('clicked', lambda *_: self.go_next())
+
+        # Next page button
+        self.next_btn = Gtk.Button(
+            icon_name="go-next-symbolic",
+            tooltip_text="Next (→/n)",
+        )
+        self.next_btn.connect("clicked", lambda *_: self.go_next())
         self.header.pack_end(self.next_btn)
-        self.two_btn = Gtk.ToggleButton(icon_name='view-dual-symbolic', tooltip_text='Two pages like book (t)')
-        self.two_btn.set_active(True)
-        self._two_handler = self.two_btn.connect('toggled', self.on_two_toggled)
+
+        # Two-page spread toggle
+        self.two_btn = Gtk.ToggleButton(
+            icon_name="view-dual-symbolic",
+            tooltip_text="Two pages like book (t)",
+        )
+        self.two_btn.set_active(self.two_page)
+        self.two_btn.connect("toggled", self.on_two_toggled)
         self.header.pack_end(self.two_btn)
-        self.theme_btn = Gtk.MenuButton(icon_name='night-light-symbolic', tooltip_text='Theme')
+
+        # Theme menu button
+        self.theme_btn = Gtk.MenuButton(
+            icon_name="night-light-symbolic",
+            tooltip_text="Theme",
+        )
         self.header.pack_end(self.theme_btn)
         self._build_theme_menu()
+
+        # Zoom buttons
         zoom_box = Gtk.Box(spacing=2)
-        for icon, cb, tip in [('zoom-out-symbolic', lambda *_: self.set_zoom(self.zoom - 0.15), 'Zoom out'), ('zoom-fit-best-symbolic', lambda *_: self.set_zoom(0, fit=True), 'Fit width'), ('zoom-in-symbolic', lambda *_: self.set_zoom(self.zoom + 0.15), 'Zoom in')]:
-            b = Gtk.Button(icon_name=icon, tooltip_text=tip)
-            b.connect('clicked', cb)
-            zoom_box.append(b)
+        zoom_out_btn = Gtk.Button(
+            icon_name="zoom-out-symbolic",
+            tooltip_text="Zoom out (-)",
+        )
+        zoom_out_btn.connect("clicked", lambda *_: self.set_zoom(self.zoom - ZOOM_STEP))
+        zoom_box.append(zoom_out_btn)
+
+        zoom_fit_btn = Gtk.Button(
+            icon_name="zoom-fit-best-symbolic",
+            tooltip_text="Fit width",
+        )
+        zoom_fit_btn.connect(
+            "clicked", lambda *_: self.set_zoom(DEFAULT_ZOOM, fit=True)
+        )
+        zoom_box.append(zoom_fit_btn)
+
+        zoom_in_btn = Gtk.Button(
+            icon_name="zoom-in-symbolic",
+            tooltip_text="Zoom in (+)",
+        )
+        zoom_in_btn.connect("clicked", lambda *_: self.set_zoom(self.zoom + ZOOM_STEP))
+        zoom_box.append(zoom_in_btn)
+
         self.header.pack_end(zoom_box)
         self.header.pack_end(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        self.juz_btn = Gtk.MenuButton(label='Juz', tooltip_text='Juz — 30 parts')
-        self.header.pack_start(self.juz_btn)
-        self._build_juz_menu()
-        self.surah_btn = Gtk.MenuButton(label='Surah', tooltip_text='Surah — 114 chapters')
-        self.header.pack_start(self.surah_btn)
-        self._build_surah_menu()
-        self.bm_btn = Gtk.MenuButton(icon_name='bookmark-new-symbolic', tooltip_text='Bookmarks (b)')
-        self.header.pack_start(self.bm_btn)
-        self._build_bookmark_menu()
-        add_bm = Gtk.Button(icon_name='bookmark-add-symbolic', tooltip_text='Add bookmark (b)')
-        add_bm.add_css_class('suggested-action')
-        add_bm.connect('clicked', self.on_add_bookmark)
-        self.header.pack_start(add_bm)
-        self.header.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+
+    def _build_content_area(self) -> None:
+        """Construct the canvas scroll view, progress bar, and status display."""
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         vbox.append(self.header)
+
         self.scrolled = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
         self.scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        self.scrolled.add_css_class('quran-scrolled')
+        self.scrolled.add_css_class("quran-scrolled")
+
         self.drawing = Gtk.DrawingArea(hexpand=True, vexpand=True)
         self.drawing.set_draw_func(self.on_draw, None)
         self.drawing.set_content_width(600)
         self.drawing.set_content_height(800)
         self.scrolled.set_child(self.drawing)
         vbox.append(self.scrolled)
+
         self.progress = Gtk.ProgressBar()
         self.progress.set_show_text(False)
-        self.progress.add_css_class('quran-progress')
+        self.progress.add_css_class("quran-progress")
         self.progress.set_fraction(0.0)
         vbox.append(self.progress)
+
         self.status = Gtk.Label(xalign=0)
-        self.status.add_css_class('dim-label')
+        self.status.add_css_class("dim-label")
         self.status.set_margin_start(6)
         self.status.set_margin_end(6)
         vbox.append(self.status)
-        self.set_content(vbox)
-        key = Gtk.EventControllerKey()
-        key.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        key.connect('key-pressed', self.on_key)
-        self.add_controller(key)
-        swipe = Gtk.GestureSwipe()
-        swipe.connect('swipe', self.on_swipe)
-        self.drawing.add_controller(swipe)
-        click = Gtk.GestureClick()
-        click.connect('pressed', self.on_click)
-        self.drawing.add_controller(click)
-        self.update_ui()
-        if self._error:
-            self.status.set_label(f'Error: {self._error}')
-        self.connect('realize', self._on_realize)
 
-    def _on_realize(self, *_):
+        self.set_content(vbox)
+
+    def _setup_event_controllers(self) -> None:
+        """Configure keyboard shortcuts, swipe gestures, and click zones."""
+        key_controller = Gtk.EventControllerKey()
+        key_controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        key_controller.connect("key-pressed", self.on_key)
+        self.add_controller(key_controller)
+
+        swipe = Gtk.GestureSwipe()
+        swipe.connect("swipe", self.on_swipe)
+        self.drawing.add_controller(swipe)
+
+        click = Gtk.GestureClick()
+        click.connect("pressed", self.on_click)
+        self.drawing.add_controller(click)
+
+    def _on_realize(self, *_args: Any) -> None:
+        """Initialize display-dependent providers on window realization."""
         display = self.get_display() or Gdk.Display.get_default()
         if display:
-            Gtk.StyleContext.add_provider_for_display(display, self._css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-            self._css_provider.load_from_string('.quran-scrolled{background:#d8cfb8}.quran-scrolled viewport{background:#d8cfb8}.compact-header{min-height:28px;padding:1px 4px}.compact-header button{min-height:22px;min-width:22px;padding:2px 6px;margin:1px}.compact-header entry{min-height:22px;padding:2px 6px}.quran-progress{min-height:3px}.quran-progress trough{min-height:3px;background:rgba(0,0,0,0.08)}.quran-progress progress{min-height:3px;background:#8a7a5a}')
+            self.theme_manager.attach_to_display(display)
+            self.theme_manager.apply_theme(self._settings.theme_mode)
 
-    def _build_theme_menu(self):
-        pop = Gtk.Popover()
+    def _on_dark_changed(self, *_args: Any) -> None:
+        """Redraw canvas when the system or application dark mode changes."""
+        self.drawing.queue_draw()
+
+    def _on_close_request(self, *_args: Any) -> bool:
+        """Persist window state and reading progress when closing."""
+        self._settings.window_width = self.get_width()
+        self._settings.window_height = self.get_height()
+        self._settings.is_maximized = self.is_maximized()
+        self._settings.current_page = self.current_page + 1
+        self._settings.two_page = self.two_page
+        self._settings.fit_width = self._fit
+        self._settings.zoom = self.zoom
+        save_settings(self._settings)
+        return False
+
+    def _persist_current_state(self) -> None:
+        """Save active reading state to disk cache."""
+        self._settings.current_page = self.current_page + 1
+        self._settings.two_page = self.two_page
+        self._settings.fit_width = self._fit
+        self._settings.zoom = self.zoom
+        self._settings.theme_mode = self.theme_manager.current_theme
+        save_settings(self._settings)
+
+    def _build_theme_menu(self) -> None:
+        """Build the theme selection popover menu."""
+        popover = Gtk.Popover()
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         box.set_margin_top(6)
         box.set_margin_bottom(6)
         box.set_margin_start(6)
         box.set_margin_end(6)
-        sm = Adw.StyleManager.get_default()
 
-        def set_scheme(s):
-            sm.set_color_scheme(s)
-            GLib.idle_add(lambda: (self.drawing.queue_draw(), False)[1])
-        themes = [('Follow System', lambda: (set_scheme(Adw.ColorScheme.DEFAULT), self._clear_css_book())), ('Light', lambda: (set_scheme(Adw.ColorScheme.FORCE_LIGHT), self._clear_css_book())), ('Dark', lambda: (set_scheme(Adw.ColorScheme.FORCE_DARK), self._clear_css_book())), ('Sepia', self.apply_sepia), ('High Contrast', self.apply_high_contrast)]
-        for label, cb in themes:
-            b = Gtk.Button(label=label)
-            b.connect('clicked', lambda _btn, c=cb: (c(), pop.popdown(), self.drawing.queue_draw()))
-            box.append(b)
-        pop.set_child(box)
-        self.theme_btn.set_popover(pop)
+        themes = [
+            ("Follow System", "system"),
+            ("Light", "light"),
+            ("Dark", "dark"),
+            ("Sepia", "sepia"),
+            ("High Contrast", "high_contrast"),
+        ]
 
-    def _clear_css_book(self):
-        self._css_provider.load_from_string('.quran-scrolled{background:#d8cfb8}.quran-scrolled viewport{background:#d8cfb8}.compact-header{min-height:28px;padding:1px 4px}.compact-header button{min-height:22px;min-width:22px;padding:2px 6px;margin:1px}.compact-header entry{min-height:22px;padding:2px 6px}')
-        self.remove_css_class('quran-sepia')
+        for label, theme_key in themes:
+            btn = Gtk.Button(label=label)
+            btn.connect("clicked", self._create_theme_callback(theme_key, popover))
+            box.append(btn)
+
+        popover.set_child(box)
+        self.theme_btn.set_popover(popover)
+
+    def _create_theme_callback(self, theme_key: str, popover: Gtk.Popover) -> Any:
+        def on_click(_button: Gtk.Button) -> None:
+            self.set_theme(theme_key)
+            popover.popdown()
+
+        return on_click
+
+    def set_theme(self, theme_name: str) -> None:
+        """Apply a theme and cache the selection."""
+        applied = self.theme_manager.apply_theme(theme_name)
+        self._settings.theme_mode = applied
+        save_settings(self._settings)
         self.drawing.queue_draw()
 
-    def apply_sepia(self):
-        sm = Adw.StyleManager.get_default()
-        sm.set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
-        self._css_provider.load_from_string('window{background:#f4ecd8}.quran-scrolled{background:#e8dcc0}.quran-scrolled viewport{background:#e8dcc0}headerbar{background:#e8dcc0}.compact-header{min-height:28px;padding:1px 4px}.compact-header button{min-height:22px;min-width:22px;padding:2px 6px;margin:1px}')
-        self.add_css_class('quran-sepia')
-        self.drawing.queue_draw()
+    # Backwards-compatible aliases
+    def apply_sepia(self) -> None:
+        self.set_theme("sepia")
 
-    def apply_high_contrast(self):
-        sm = Adw.StyleManager.get_default()
-        sm.set_color_scheme(Adw.ColorScheme.FORCE_DARK)
-        self._css_provider.load_from_string('window,.quran-scrolled,.quran-scrolled viewport{background:#000;color:#fff}headerbar{background:#111}.compact-header{min-height:28px;padding:1px 4px}.compact-header button{min-height:22px;min-width:22px;padding:2px 6px;margin:1px}')
-        self.remove_css_class('quran-sepia')
-        self.drawing.queue_draw()
+    def apply_high_contrast(self) -> None:
+        self.set_theme("high_contrast")
 
-    def _build_juz_menu(self):
-        pop = Gtk.Popover()
+    def _build_juz_menu(self) -> None:
+        """Build the Juz navigation popover grid."""
+        popover = Gtk.Popover()
         grid = Gtk.Grid(column_spacing=4, row_spacing=4)
         grid.set_margin_top(6)
         grid.set_margin_bottom(6)
         grid.set_margin_start(6)
         grid.set_margin_end(6)
-        for i, j in enumerate(JUZ_DATA):
-            b = Gtk.Button(label=f"Juz {j['juz']}")
-            b.set_tooltip_text(f"Page {j['page']}")
-            b.connect('clicked', lambda _b, p=j['page']: (self.go_to_page(p), pop.popdown()))
-            grid.attach(b, i % 5, i // 5, 1, 1)
-        pop.set_child(grid)
-        self.juz_btn.set_popover(pop)
 
-    def _build_surah_menu(self):
-        pop = Gtk.Popover()
-        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        v.set_margin_top(6)
-        v.set_margin_bottom(6)
-        v.set_margin_start(6)
-        v.set_margin_end(6)
-        search = Gtk.SearchEntry(placeholder_text='Search surah…')
-        sc = Gtk.ScrolledWindow(vexpand=True)
-        sc.set_min_content_height(300)
-        sc.set_min_content_width(340)
-        sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        lb = Gtk.ListBox()
-        lb.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        rows = []
-        for s in SURAH_DATA:
+        for i, item in enumerate(JUZ_DATA):
+            page_num = item["page"]
+            btn = Gtk.Button(label=f"Juz {item['juz']}")
+            btn.set_tooltip_text(f"Page {page_num}")
+            btn.connect("clicked", self._create_jump_callback(page_num, popover))
+            grid.attach(btn, i % 5, i // 5, 1, 1)
+
+        popover.set_child(grid)
+        self.juz_btn.set_popover(popover)
+
+    def _build_surah_menu(self) -> None:
+        """Build the Surah search and selection popover."""
+        popover = Gtk.Popover()
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        vbox.set_margin_top(6)
+        vbox.set_margin_bottom(6)
+        vbox.set_margin_start(6)
+        vbox.set_margin_end(6)
+
+        search = Gtk.SearchEntry(placeholder_text="Search surah…")
+        scrolled = Gtk.ScrolledWindow(vexpand=True)
+        scrolled.set_min_content_height(300)
+        scrolled.set_min_content_width(340)
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.add_css_class("surah-scrolled")
+
+        list_box = Gtk.ListBox()
+        list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        list_box.add_css_class("surah-list")
+        rows: list[tuple[Gtk.ListBoxRow, dict[str, Any]]] = []
+
+        for surah in SURAH_DATA:
             row = Gtk.ListBoxRow()
-            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            box.set_margin_top(4)
-            box.set_margin_bottom(4)
-            box.set_margin_start(6)
-            box.set_margin_end(6)
-            box.append(Gtk.Label(label=f"{s['id']:3d}. {s['name']}", xalign=0, hexpand=True))
-            box.append(Gtk.Label(label=s['arabic'], xalign=1))
-            box.append(Gtk.Label(label=f"p.{s['page']}", xalign=1))
-            row.set_child(box)
-            row._page = s['page']
-            lb.append(row)
-            rows.append((row, s))
+            hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            hbox.set_margin_top(4)
+            hbox.set_margin_bottom(4)
+            hbox.set_margin_start(6)
+            hbox.set_margin_end(6)
 
-        def on_filter(_e):
-            q = search.get_text().lower().strip()
-            for row, s in rows:
-                visible = not q or q in s['name'].lower() or q in s['arabic'] or (q in str(s['id']))
-                row.set_visible(visible)
-        search.connect('search-changed', on_filter)
+            title_label = Gtk.Label(
+                label=f"{surah['id']:3d}. {surah['name']}",
+                xalign=0,
+                hexpand=True,
+            )
+            arabic_label = Gtk.Label(label=surah["arabic"], xalign=1)
+            page_label = Gtk.Label(label=f"p.{surah['page']}", xalign=1)
 
-        def on_activate(_lb, row):
-            self.go_to_page(row._page)
-            pop.popdown()
-        lb.connect('row-activated', on_activate)
-        sc.set_child(lb)
-        v.append(search)
-        v.append(sc)
-        pop.set_child(v)
-        self.surah_btn.set_popover(pop)
+            hbox.append(title_label)
+            hbox.append(arabic_label)
+            hbox.append(page_label)
+            row.set_child(hbox)
+            row._page = surah["page"]  # type: ignore[attr-defined]
 
-    def _build_bookmark_menu(self):
-        pop = Gtk.Popover()
-        self._bm_pop = pop
+            list_box.append(row)
+            rows.append((row, surah))
+
+        def on_filter(_entry: Gtk.SearchEntry) -> None:
+            query = search.get_text().lower().strip()
+            for row_widget, data in rows:
+                match = (
+                    not query
+                    or query in data["name"].lower()
+                    or query in data["arabic"]
+                    or query in str(data["id"])
+                )
+                row_widget.set_visible(match)
+
+        search.connect("search-changed", on_filter)
+
+        def on_row_activated(_box: Gtk.ListBox, activated_row: Gtk.ListBoxRow) -> None:
+            self.go_to_page(activated_row._page)  # type: ignore[attr-defined]
+            popover.popdown()
+
+        list_box.connect("row-activated", on_row_activated)
+        scrolled.set_child(list_box)
+        vbox.append(search)
+        vbox.append(scrolled)
+        popover.set_child(vbox)
+        self.surah_btn.set_popover(popover)
+
+    def _build_bookmark_menu(self) -> None:
+        """Build the bookmarks list popover."""
+        self._bm_pop = Gtk.Popover()
         self._bm_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self._bm_box.set_margin_top(6)
         self._bm_box.set_margin_bottom(6)
         self._bm_box.set_margin_start(6)
         self._bm_box.set_margin_end(6)
-        pop.set_child(self._bm_box)
-        self.bm_btn.set_popover(pop)
-        pop.connect('notify::visible', lambda *_: self._refresh_bm())
 
-    def _refresh_bm(self):
+        self._bm_pop.set_child(self._bm_box)
+        self.bm_btn.set_popover(self._bm_pop)
+        self._bm_pop.connect("notify::visible", lambda *_: self._refresh_bookmarks())
+
+    def _refresh_bookmarks(self) -> None:
+        """Re-render items inside the bookmarks popover."""
         child = self._bm_box.get_first_child()
         while child:
-            nxt = child.get_next_sibling()
+            next_sibling = child.get_next_sibling()
             self._bm_box.remove(child)
-            child = nxt
-        bms = bookmarks.load()
-        if not bms:
-            self._bm_box.append(Gtk.Label(label='No bookmarks', xalign=0))
-        for idx, bm in enumerate(bms):
+            child = next_sibling
+
+        items = bookmarks.load()
+        if not items:
+            self._bm_box.append(Gtk.Label(label="No bookmarks", xalign=0))
+
+        for idx, item in enumerate(items):
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            btn = Gtk.Button(label=bm.get('label', f"Page {bm['page']}"))
-            btn.set_tooltip_text(f"Page {bm['page']}")
-            btn.connect('clicked', lambda _b, p=bm['page']: (self.go_to_page(p), self._bm_pop.popdown()))
+            page_num = item["page"]
+            btn = Gtk.Button(label=item.get("label", f"Page {page_num}"))
+            btn.set_tooltip_text(f"Page {page_num}")
+            btn.connect("clicked", self._create_jump_callback(page_num, self._bm_pop))
             row.append(btn)
-            rm = Gtk.Button(icon_name='edit-delete-symbolic')
-            rm.connect('clicked', lambda _b, i=idx: (bookmarks.remove(i), self._refresh_bm()))
-            row.append(rm)
+
+            del_btn = Gtk.Button(icon_name="edit-delete-symbolic")
+            del_btn.connect("clicked", self._create_delete_bookmark_callback(idx))
+            row.append(del_btn)
             self._bm_box.append(row)
-        hb = Gtk.Box(spacing=4)
-        clear = Gtk.Button(label='Clear all')
-        clear.connect('clicked', lambda *_: (bookmarks.clear(), self._refresh_bm()))
-        hb.append(clear)
-        self._bm_box.append(hb)
 
-    def on_add_bookmark(self, *_):
-        page1 = self.current_page + 1
-        bookmarks.add(page1, label=f'Page {page1}')
-        self.status.set_label(f'Bookmarked page {page1}')
-        self._refresh_bm()
+        actions_box = Gtk.Box(spacing=4)
+        clear_btn = Gtk.Button(label="Clear all")
+        clear_btn.connect("clicked", lambda *_: self._clear_all_bookmarks())
+        actions_box.append(clear_btn)
+        self._bm_box.append(actions_box)
 
-    def go_to_page(self, p_1based: int):
+    def _create_jump_callback(self, page_num: int, popover: Gtk.Popover) -> Any:
+        def on_jump(_btn: Gtk.Button) -> None:
+            self.go_to_page(page_num)
+            popover.popdown()
+
+        return on_jump
+
+    def _create_delete_bookmark_callback(self, idx: int) -> Any:
+        def on_delete(_btn: Gtk.Button) -> None:
+            bookmarks.remove(idx)
+            self._refresh_bookmarks()
+
+        return on_delete
+
+    def _clear_all_bookmarks(self) -> None:
+        bookmarks.clear()
+        self._refresh_bookmarks()
+
+    def on_add_bookmark(self) -> None:
+        """Add a bookmark for the active 1-based page number."""
+        page_1based = self.current_page + 1
+        bookmarks.add(page_1based, label=f"Page {page_1based}")
+        self.status.set_label(f"Bookmarked page {page_1based}")
+        self._refresh_bookmarks()
+
+    def go_to_page(self, page_1based: int) -> None:
+        """Navigate directly to the specified 1-based page number."""
         if not self.doc:
             return
-        n = self.doc.get_n_pages()
-        p = max(self.first_page + 1, min(p_1based, n))
-        target = p - 1
-        if target == self.current_page:
-            return
-        direction = 1 if target > self.current_page else -1
-        self._animate_to(target, direction)
+        total = self.doc.get_n_pages()
+        clamped_1based = max(self.first_page + 1, min(page_1based, total))
+        target_0based = clamped_1based - 1
 
-    def go_prev(self):
+        if target_0based == self.current_page:
+            return
+
+        self.current_page = target_0based
+        self.update_ui()
+        self._persist_current_state()
+
+    def go_prev(self) -> None:
+        """Navigate backward by one step."""
         if not self.doc:
             return
+        if self.current_page <= self.first_page:
+            return
+
+        step = 2 if self.two_page else 1
+        target = max(self.first_page, self.current_page - step)
+        self.current_page = target
+        self.update_ui()
+        self._persist_current_state()
+
+    def go_next(self) -> None:
+        """Navigate forward by one step."""
+        if not self.doc:
+            return
+        total = self.doc.get_n_pages()
         if self.two_page:
             step = 2
-            if self.current_page <= self.first_page:
-                return
-            target = max(self.first_page, self.current_page - step)
-        else:
-            if self.current_page <= self.first_page:
-                return
-            target = self.current_page - 1
-        self._animate_to(target, -1)
-
-    def go_next(self):
-        if not self.doc:
-            return
-        n = self.doc.get_n_pages()
-        if self.two_page:
-            step = 2
-            if self.current_page + step < n:
+            if self.current_page + step < total:
                 target = self.current_page + step
-            elif self.current_page + 1 < n:
+            elif self.current_page + 1 < total:
                 target = self.current_page + 1
             else:
                 return
         else:
-            if self.current_page >= n - 1:
+            if self.current_page >= total - 1:
                 return
             target = self.current_page + 1
-        self._animate_to(target, 1)
 
-    def _compute_scale(self, pw, ph, avail_w, for_two=False, pw1=0, ph1=0):
-        if for_two:
-            gap = 12
-            total_w = pw + pw1 + gap
-            max_h = max(ph, ph1)
-            if self._fit:
-                scale = avail_w / total_w
-                return (scale, total_w, max_h)
-            else:
-                return (self.zoom, total_w, max_h)
-        elif self._fit:
-            scale = avail_w / pw
-            return (scale, pw, ph)
-        else:
-            return (self.zoom, pw, ph)
-
-    def _animate_to(self, target: int, direction: int):
-        if not self.doc:
-            self.current_page = target
-            self.update_ui()
-            return
         self.current_page = target
         self.update_ui()
+        self._persist_current_state()
 
-    def _render_spread_surface(self, start_page: int, scale: float):
-        n = self.doc.get_n_pages()
-        pw_cur, ph_cur = self.doc.get_page_size(start_page)
-        has_second = start_page + 1 < n
-        if has_second:
-            pw_nxt, ph_nxt = self.doc.get_page_size(start_page + 1)
-        else:
-            pw_nxt, ph_nxt = (pw_cur, ph_cur)
-        gap = 12
-        if self.rtl and has_second:
-            total_w = pw_nxt + pw_cur + gap
-            max_h = max(ph_nxt, ph_cur)
-            w, h = (int(total_w * scale), int(max_h * scale))
-            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, max(1, w), max(1, h))
-            cr = cairo.Context(surf)
-            cr.set_source_rgb(0.85, 0.85, 0.85)
-            cr.rectangle(pw_nxt * scale, 0, gap * scale, h)
-            cr.fill()
-            for pw, ph, p_idx, xoff in [(pw_nxt, ph_nxt, start_page + 1, 0), (pw_cur, ph_cur, start_page, (pw_nxt + gap) * scale)]:
-                yoff = (max_h * scale - ph * scale) / 2
-                cr.save()
-                cr.translate(xoff, yoff)
-                cr.scale(scale, scale)
-                cr.set_source_rgb(1, 1, 1)
-                cr.rectangle(0, 0, pw, ph)
-                cr.fill()
-                try:
-                    self.doc.get_page(p_idx).render(cr)
-                except:
-                    pass
-                cr.restore()
-                if p_idx == start_page + 1:
-                    cr.set_source_rgba(0, 0, 0, 0.08)
-                    cr.rectangle(pw_nxt * scale, 0, 4 * scale, h)
-                    cr.fill()
-                else:
-                    cr.set_source_rgba(0, 0, 0, 0.06)
-                    cr.rectangle((pw_nxt + gap) * scale, 0, 4 * scale, h)
-                    cr.fill()
-        else:
-            total_w = pw_cur + (pw_nxt if has_second else 0) + (gap if has_second else 0)
-            max_h = max(ph_cur, ph_nxt if has_second else ph_cur)
-            w, h = (int(total_w * scale), int(max_h * scale))
-            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, max(1, w), max(1, h))
-            cr = cairo.Context(surf)
-            cr.set_source_rgb(0.85, 0.85, 0.85)
-            if has_second:
-                cr.rectangle(pw_cur * scale, 0, gap * scale, h)
-                cr.fill()
-            for idx, (pw, ph) in enumerate([(pw_cur, ph_cur), (pw_nxt, ph_nxt)] if has_second else [(pw_cur, ph_cur)]):
-                xoff = 0 if idx == 0 else (pw_cur + gap) * scale
-                yoff = (max_h * scale - ph * scale) / 2
-                cr.save()
-                cr.translate(xoff, yoff)
-                cr.scale(scale, scale)
-                cr.set_source_rgb(1, 1, 1)
-                cr.rectangle(0, 0, pw, ph)
-                cr.fill()
-                try:
-                    self.doc.get_page(start_page + idx).render(cr)
-                except:
-                    pass
-                cr.restore()
-                if has_second:
-                    if idx == 0:
-                        cr.set_source_rgba(0, 0, 0, 0.08)
-                        cr.rectangle(pw_cur * scale, 0, 4 * scale, h)
-                        cr.fill()
-                    else:
-                        cr.set_source_rgba(0, 0, 0, 0.06)
-                        cr.rectangle((pw_cur + gap) * scale, 0, 4 * scale, h)
-                        cr.fill()
-        if _is_dark():
-            _invert_surface(surf)
-        return (surf, total_w * scale, max_h * scale)
-
-    def on_two_toggled(self, btn):
+    def on_two_toggled(self, btn: Gtk.ToggleButton) -> None:
+        """Handle two-page view toggle."""
         self.two_page = btn.get_active()
         self.update_ui()
         self.drawing.queue_draw()
+        self._persist_current_state()
 
-    def _toggle_fullscreen(self):
+    def set_zoom(self, zoom_level: float, fit: bool = False) -> None:
+        """Adjust canvas zoom level or toggle fit-to-width."""
+        if fit:
+            self._fit = True
+            self.zoom = 1.0
+        else:
+            self._fit = False
+            self.zoom = max(MIN_ZOOM, min(zoom_level, MAX_ZOOM))
+
+        self.drawing.queue_draw()
+        self.status.set_label("")
+        self._persist_current_state()
+
+    def _toggle_fullscreen(self) -> None:
+        """Toggle fullscreen mode on or off."""
         if self.is_fullscreen():
             self.unfullscreen()
             self.header.set_visible(True)
@@ -461,27 +598,24 @@ class QuranWindow(Adw.ApplicationWindow):
             self.status.set_visible(False)
             self.progress.set_visible(False)
 
-    def on_key(self, _ctrl, keyval, _keycode, _state):
+    def on_key(self, _ctrl: Any, keyval: int, _keycode: int, _state: Any) -> bool:
+        """Handle keyboard navigation and shortcuts."""
+        # Page navigation (RTL aware: Right goes prev, Left goes next)
         if self.rtl:
-            if keyval in (Gdk.KEY_Right, Gdk.KEY_p):
+            if keyval in (Gdk.KEY_Right, Gdk.KEY_p, Gdk.KEY_Page_Up):
                 self.go_prev()
                 return True
-            if keyval in (Gdk.KEY_Left, Gdk.KEY_n):
+            if keyval in (Gdk.KEY_Left, Gdk.KEY_n, Gdk.KEY_Page_Down):
                 self.go_next()
-                return True
-            if keyval == Gdk.KEY_Page_Down:
-                self.go_next()
-                return True
-            if keyval == Gdk.KEY_Page_Up:
-                self.go_prev()
                 return True
         else:
-            if keyval in (Gdk.KEY_Right, Gdk.KEY_Page_Down, Gdk.KEY_n):
+            if keyval in (Gdk.KEY_Right, Gdk.KEY_n, Gdk.KEY_Page_Down):
                 self.go_next()
                 return True
-            if keyval in (Gdk.KEY_Left, Gdk.KEY_Page_Up, Gdk.KEY_p):
+            if keyval in (Gdk.KEY_Left, Gdk.KEY_p, Gdk.KEY_Page_Up):
                 self.go_prev()
                 return True
+
         if keyval == Gdk.KEY_Home:
             self.go_to_page(1)
             return True
@@ -489,10 +623,10 @@ class QuranWindow(Adw.ApplicationWindow):
             self.go_to_page(self.doc.get_n_pages())
             return True
         if keyval in (Gdk.KEY_plus, Gdk.KEY_equal):
-            self.set_zoom(self.zoom + 0.15)
+            self.set_zoom(self.zoom + ZOOM_STEP)
             return True
         if keyval == Gdk.KEY_minus:
-            self.set_zoom(self.zoom - 0.15)
+            self.set_zoom(self.zoom - ZOOM_STEP)
             return True
         if keyval == Gdk.KEY_b:
             self.on_add_bookmark()
@@ -506,252 +640,317 @@ class QuranWindow(Adw.ApplicationWindow):
         if keyval == Gdk.KEY_Escape and self.is_fullscreen():
             self._toggle_fullscreen()
             return True
+
         return False
 
-    def on_swipe(self, _gesture, vx, _vy):
+    def on_swipe(self, _gesture: Gtk.GestureSwipe, vx: float, _vy: float) -> None:
+        """Handle touch swipe navigation."""
         if self.rtl:
             if vx < -120:
                 self.go_prev()
             elif vx > 120:
                 self.go_next()
-        elif vx < -120:
-            self.go_next()
-        elif vx > 120:
-            self.go_prev()
-
-    def on_click(self, _gesture, _n, x, _y):
-        w = self.drawing.get_width()
-        if w == 0:
-            return
-        if self.rtl:
-            if x < w * 0.28:
-                self.go_next()
-            elif x > w * 0.72:
-                self.go_prev()
-        elif x < w * 0.28:
-            self.go_prev()
-        elif x > w * 0.72:
-            self.go_next()
-
-    def set_zoom(self, z, fit=False):
-        if fit:
-            self._fit = True
-            self.zoom = 1.0
         else:
-            self._fit = False
-            self.zoom = max(0.3, min(z, 3.0))
-        self.drawing.queue_draw()
-        self.status.set_label('')
+            if vx < -120:
+                self.go_next()
+            elif vx > 120:
+                self.go_prev()
 
-    def update_ui(self):
+    def on_click(
+        self, _gesture: Gtk.GestureClick, _n: int, x: float, _y: float
+    ) -> None:
+        """Handle side-tap page flipping."""
+        width = self.drawing.get_width()
+        if width == 0:
+            return
+
+        if self.rtl:
+            if x < width * 0.28:
+                self.go_next()
+            elif x > width * 0.72:
+                self.go_prev()
+        else:
+            if x < width * 0.28:
+                self.go_prev()
+            elif x > width * 0.72:
+                self.go_next()
+
+    def update_ui(self) -> None:
+        """Update navigation button sensitivity and progress indicators."""
         if not self.doc:
             return
+
+        total_pages = self.doc.get_n_pages()
         self.prev_btn.set_sensitive(self.current_page > self.first_page)
-        self.next_btn.set_sensitive(self.current_page < self.doc.get_n_pages() - 1)
-        try:
-            total = self.doc.get_n_pages() - self.first_page
-            cur = self.current_page - self.first_page + 1
-            self.progress.set_fraction(max(0.0, min(1.0, cur / total)) if total else 0)
-        except:
-            pass
+        self.next_btn.set_sensitive(self.current_page < total_pages - 1)
+
+        total_reading = total_pages - self.first_page
+        current_reading = self.current_page - self.first_page + 1
+        if total_reading > 0:
+            fraction = max(0.0, min(1.0, current_reading / total_reading))
+            self.progress.set_fraction(fraction)
+
         self.drawing.queue_draw()
 
-    def on_draw(self, area, cr, _w, _h, _data):
+    def on_draw(
+        self,
+        area: Gtk.DrawingArea,
+        cr: cairo.Context,
+        _w: int,
+        _h: int,
+        _data: Any,
+    ) -> None:
+        """Render the reading canvas for single or dual page layouts."""
         if not self.doc:
             cr.set_source_rgb(0.2, 0.2, 0.2)
-            cr.select_font_face('Sans', 0, 0)
+            cr.select_font_face(
+                "Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL
+            )
             cr.set_font_size(14)
             cr.move_to(20, 30)
-            cr.show_text(self._error or 'No document')
+            cr.show_text(self._error or "No document loaded")
             return
+
         alloc_w = self.scrolled.get_width() or area.get_width() or 900
         alloc_h = self.scrolled.get_height() or area.get_height() or 700
+
+        # Background fill
         cr.save()
-        if _is_dark():
+        if is_dark_mode():
             cr.set_source_rgb(0.08, 0.08, 0.08)
+        elif self.theme_manager.current_theme == "sepia":
+            cr.set_source_rgb(0.91, 0.86, 0.75)
         else:
-            cr.set_source_rgb(0.84, 0.8, 0.71)
+            cr.set_source_rgb(0.84, 0.80, 0.71)
         cr.paint()
         cr.restore()
+
         avail_w = max(200, alloc_w - 56)
         avail_h = max(200, alloc_h - 76)
+
         if self.two_page:
-            pw_cur, ph_cur = self.doc.get_page_size(self.current_page)
-            has_second = self.current_page + 1 < self.doc.get_n_pages()
-            if has_second:
-                pw_nxt, ph_nxt = self.doc.get_page_size(self.current_page + 1)
-            else:
-                pw_nxt, ph_nxt = (pw_cur, ph_cur)
-            gap = 12
-            if self.rtl and has_second:
-                pw_left, ph_left = (pw_nxt, ph_nxt)
-                pw_right, ph_right = (pw_cur, ph_cur)
-                total_w = pw_left + pw_right + gap
-                max_h = max(ph_left, ph_right)
-            else:
-                pw_left, ph_left = (None, None)
-                pw_right, ph_right = (None, None)
-                total_w = pw_cur + (pw_nxt if has_second else 0) + (gap if has_second else 0)
-                max_h = max(ph_cur, ph_nxt if has_second else ph_cur)
-            if self._fit:
-                scale = min(avail_w / total_w, avail_h / max_h)
-                self.zoom = scale
-            else:
-                scale = self.zoom
-            w = int(total_w * scale)
-            h = int(max_h * scale)
-            if w + 40 < alloc_w:
-                area.set_content_width(alloc_w)
-                area.set_content_height(max(h + 80, alloc_h))
-                ox = (alloc_w - w) // 2
-                oy = (alloc_h - h) // 2
-                if oy < 20:
-                    oy = 20
-            else:
-                area.set_content_width(w + 40)
-                area.set_content_height(h + 40)
-                ox = 20
-                oy = 20
-            cr.save()
-            cr.translate(ox, oy)
-            cr.set_source_rgba(0, 0, 0, 0.25)
-            cr.rectangle(4, 4, w, h)
-            cr.fill()
-            cr.set_source_rgba(0, 0, 0, 0.12)
-            cr.rectangle(2, 2, w, h)
-            cr.fill()
-            cr.set_source_rgb(0.55, 0.5, 0.45)
-            cr.rectangle(-1, -1, w + 2, h + 2)
-            cr.stroke()
-            cr.restore()
-            if _is_dark():
-                surf, _, _ = self._render_spread_surface(self.current_page, scale)
-                cr.save()
-                cr.translate(ox, oy)
-                cr.set_source_surface(surf, 0, 0)
-                cr.paint()
-                cr.restore()
-            else:
-                cr.save()
-                cr.translate(ox, oy)
-                cr.scale(scale, scale)
-                cr.set_source_rgb(0.88, 0.86, 0.82)
-                if has_second:
-                    if self.rtl:
-                        cr.rectangle(pw_nxt, 0, gap, max_h)
-                        cr.fill()
-                    else:
-                        cr.rectangle(pw_cur, 0, gap, max_h)
-                        cr.fill()
-                if self.rtl and has_second:
-                    pages = [(pw_nxt, ph_nxt, self.current_page + 1, 0), (pw_cur, ph_cur, self.current_page, pw_nxt + gap)]
-                else:
-                    pages = [(pw_cur, ph_cur, self.current_page, 0)]
-                    if has_second:
-                        pages.append((pw_nxt, ph_nxt, self.current_page + 1, pw_cur + gap))
-                for pw, ph, p_idx, xoff in pages:
-                    yoff = (max_h - ph) / 2
-                    cr.save()
-                    cr.translate(xoff, yoff)
-                    cr.set_source_rgb(1, 1, 1)
-                    cr.rectangle(0, 0, pw, ph)
-                    cr.fill()
-                    try:
-                        self.doc.get_page(p_idx).render(cr)
-                    except Exception as e:
-                        cr.set_source_rgb(0.8, 0, 0)
-                        cr.move_to(10, 20)
-                        cr.show_text(str(e))
-                    cr.restore()
-                    if has_second:
-                        if self.rtl:
-                            if p_idx == self.current_page + 1:
-                                grad = cairo.LinearGradient(pw_nxt - 8, 0, pw_nxt + 4, 0)
-                                grad.add_color_stop_rgba(0, 0, 0, 0, 0)
-                                grad.add_color_stop_rgba(1, 0, 0, 0, 0.16)
-                                cr.set_source(grad)
-                                cr.rectangle(pw_nxt - 8, 0, 12, max_h)
-                                cr.fill()
-                            else:
-                                grad = cairo.LinearGradient(pw_nxt + gap - 4, 0, pw_nxt + gap + 8, 0)
-                                grad.add_color_stop_rgba(0, 0, 0, 0, 0.14)
-                                grad.add_color_stop_rgba(1, 0, 0, 0, 0)
-                                cr.set_source(grad)
-                                cr.rectangle(pw_nxt + gap - 4, 0, 12, max_h)
-                                cr.fill()
-                        elif p_idx == self.current_page:
-                            grad = cairo.LinearGradient(pw_cur - 8, 0, pw_cur + 4, 0)
-                            grad.add_color_stop_rgba(0, 0, 0, 0, 0)
-                            grad.add_color_stop_rgba(1, 0, 0, 0, 0.16)
-                            cr.set_source(grad)
-                            cr.rectangle(pw_cur - 8, 0, 12, max_h)
-                            cr.fill()
-                        else:
-                            grad = cairo.LinearGradient(pw_cur + gap - 4, 0, pw_cur + gap + 8, 0)
-                            grad.add_color_stop_rgba(0, 0, 0, 0, 0.14)
-                            grad.add_color_stop_rgba(1, 0, 0, 0, 0)
-                            cr.set_source(grad)
-                            cr.rectangle(pw_cur + gap - 4, 0, 12, max_h)
-                            cr.fill()
-                cr.set_source_rgba(0, 0, 0, 0.06)
-                cr.rectangle(0, 0, total_w, 1)
-                cr.fill()
-                cr.rectangle(0, max_h - 1, total_w, 1)
-                cr.fill()
-                cr.restore()
+            self._draw_two_page(area, cr, alloc_w, alloc_h, avail_w, avail_h)
         else:
-            pw, ph = self.doc.get_page_size(self.current_page)
-            if self._fit:
-                scale = min(avail_w / pw, avail_h / ph)
-                self.zoom = scale
-            else:
-                scale = self.zoom
-            w = int(pw * scale)
-            h = int(ph * scale)
-            if w + 40 < alloc_w:
-                area.set_content_width(alloc_w)
-                area.set_content_height(max(h + 80, alloc_h))
-                ox = (alloc_w - w) // 2
-                oy = (alloc_h - h) // 2
-                if oy < 20:
-                    oy = 20
-            else:
-                area.set_content_width(w + 40)
-                area.set_content_height(h + 40)
-                ox = 20
-                oy = 20
+            self._draw_single_page(area, cr, alloc_w, alloc_h, avail_w, avail_h)
+
+    def _draw_two_page(
+        self,
+        area: Gtk.DrawingArea,
+        cr: cairo.Context,
+        alloc_w: int,
+        alloc_h: int,
+        avail_w: int,
+        avail_h: int,
+    ) -> None:
+        """Draw two-page book spread layout."""
+        assert self.doc is not None
+        total_pages = self.doc.get_n_pages()
+        pw_cur, ph_cur = self.doc.get_page_size(self.current_page)
+        has_second = self.current_page + 1 < total_pages
+
+        if has_second:
+            pw_nxt, ph_nxt = self.doc.get_page_size(self.current_page + 1)
+        else:
+            pw_nxt, ph_nxt = (pw_cur, ph_cur)
+
+        gap = PAGE_GAP
+        if self.rtl and has_second:
+            total_w = pw_nxt + pw_cur + gap
+            max_h = max(ph_nxt, ph_cur)
+        else:
+            total_w = pw_cur + (pw_nxt + gap if has_second else 0)
+            max_h = max(ph_cur, ph_nxt if has_second else ph_cur)
+
+        if self._fit:
+            scale = min(avail_w / total_w, avail_h / max_h)
+            self.zoom = scale
+        else:
+            scale = self.zoom
+
+        w = int(total_w * scale)
+        h = int(max_h * scale)
+
+        if w + 40 < alloc_w:
+            area.set_content_width(alloc_w)
+            area.set_content_height(max(h + 80, alloc_h))
+            ox = (alloc_w - w) // 2
+            oy = max((alloc_h - h) // 2, 20)
+        else:
+            area.set_content_width(w + 40)
+            area.set_content_height(h + 40)
+            ox = 20
+            oy = 20
+
+        draw_dropshadow(cr, ox, oy, w, h)
+
+        if is_dark_mode():
+            surface, _, _ = render_spread_surface(
+                self.doc,
+                self.current_page,
+                scale,
+                rtl=self.rtl,
+            )
             cr.save()
             cr.translate(ox, oy)
-            cr.set_source_rgba(0, 0, 0, 0.25)
-            cr.rectangle(4, 4, w, h)
-            cr.fill()
-            cr.set_source_rgba(0, 0, 0, 0.12)
-            cr.rectangle(2, 2, w, h)
-            cr.fill()
-            if _is_dark():
-                surf, _, _ = render_page_to_surface(self.doc.get_page(self.current_page), scale)
-                cr.set_source_surface(surf, 0, 0)
-                cr.paint()
+            cr.set_source_surface(surface, 0, 0)
+            cr.paint()
+            cr.restore()
+        else:
+            cr.save()
+            cr.translate(ox, oy)
+            cr.scale(scale, scale)
+            if self.theme_manager.current_theme == "sepia":
+                cr.set_source_rgb(0.89, 0.84, 0.73)
             else:
+                cr.set_source_rgb(0.88, 0.86, 0.82)
+
+            if has_second:
+                gutter_x = pw_nxt if self.rtl else pw_cur
+                cr.rectangle(gutter_x, 0, gap, max_h)
+                cr.fill()
+
+            if self.rtl and has_second:
+                pages = [
+                    (pw_nxt, ph_nxt, self.current_page + 1, 0.0),
+                    (pw_cur, ph_cur, self.current_page, pw_nxt + gap),
+                ]
+            else:
+                pages = [(pw_cur, ph_cur, self.current_page, 0.0)]
+                if has_second:
+                    pages.append((pw_nxt, ph_nxt, self.current_page + 1, pw_cur + gap))
+
+            for pw, ph, p_idx, xoff in pages:
+                yoff = (max_h - ph) / 2.0
                 cr.save()
-                cr.scale(scale, scale)
-                cr.set_source_rgb(1, 1, 1)
+                cr.translate(xoff, yoff)
+                cr.set_source_rgb(1.0, 1.0, 1.0)
                 cr.rectangle(0, 0, pw, ph)
                 cr.fill()
                 try:
-                    self.doc.get_page(self.current_page).render(cr)
-                except Exception as e:
-                    cr.set_source_rgb(0.8, 0, 0)
-                    cr.move_to(10, 20)
-                    cr.show_text(str(e))
+                    self.doc.get_page(p_idx).render(cr)
+                except (GLib.Error, RuntimeError, cairo.Error) as exc:
+                    _LOGGER.warning("Poppler render failed on page %d: %s", p_idx, exc)
                 cr.restore()
-                cr.set_source_rgba(0, 0, 0, 0.06)
-                cr.rectangle(0, 0, w, 1)
+
+                if has_second:
+                    self._draw_spine_shadow(cr, pw_nxt, max_h, gap, p_idx)
+
+            # Top and bottom trim borders
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.06)
+            cr.rectangle(0, 0, total_w, 1)
+            cr.fill()
+            cr.rectangle(0, max_h - 1, total_w, 1)
+            cr.fill()
+            cr.restore()
+
+    def _draw_spine_shadow(
+        self,
+        cr: cairo.Context,
+        pw_left: float,
+        max_h: float,
+        gap: float,
+        page_idx: int,
+    ) -> None:
+        """Render realistic soft gradient shadows along the inner book spine."""
+        if self.rtl:
+            if page_idx == self.current_page + 1:
+                grad = cairo.LinearGradient(pw_left - 8, 0, pw_left + 4, 0)
+                grad.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, 0.0)
+                grad.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 0.16)
+                cr.set_source(grad)
+                cr.rectangle(pw_left - 8, 0, 12, max_h)
                 cr.fill()
-                cr.rectangle(0, h - 1, w, 1)
+            else:
+                grad = cairo.LinearGradient(pw_left + gap - 4, 0, pw_left + gap + 8, 0)
+                grad.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, 0.14)
+                grad.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 0.0)
+                cr.set_source(grad)
+                cr.rectangle(pw_left + gap - 4, 0, 12, max_h)
                 cr.fill()
-                cr.rectangle(0, 0, 1, h)
+        else:
+            if page_idx == self.current_page:
+                grad = cairo.LinearGradient(pw_left - 8, 0, pw_left + 4, 0)
+                grad.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, 0.0)
+                grad.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 0.16)
+                cr.set_source(grad)
+                cr.rectangle(pw_left - 8, 0, 12, max_h)
                 cr.fill()
-                cr.rectangle(w - 1, 0, 1, h)
+            else:
+                grad = cairo.LinearGradient(pw_left + gap - 4, 0, pw_left + gap + 8, 0)
+                grad.add_color_stop_rgba(0.0, 0.0, 0.0, 0.0, 0.14)
+                grad.add_color_stop_rgba(1.0, 0.0, 0.0, 0.0, 0.0)
+                cr.set_source(grad)
+                cr.rectangle(pw_left + gap - 4, 0, 12, max_h)
                 cr.fill()
+
+    def _draw_single_page(
+        self,
+        area: Gtk.DrawingArea,
+        cr: cairo.Context,
+        alloc_w: int,
+        alloc_h: int,
+        avail_w: int,
+        avail_h: int,
+    ) -> None:
+        """Draw single page layout centered."""
+        assert self.doc is not None
+        pw, ph = self.doc.get_page_size(self.current_page)
+
+        if self._fit:
+            scale = min(avail_w / pw, avail_h / ph)
+            self.zoom = scale
+        else:
+            scale = self.zoom
+
+        w = int(pw * scale)
+        h = int(ph * scale)
+
+        if w + 40 < alloc_w:
+            area.set_content_width(alloc_w)
+            area.set_content_height(max(h + 80, alloc_h))
+            ox = (alloc_w - w) // 2
+            oy = max((alloc_h - h) // 2, 20)
+        else:
+            area.set_content_width(w + 40)
+            area.set_content_height(h + 40)
+            ox = 20
+            oy = 20
+
+        draw_dropshadow(cr, ox, oy, w, h)
+
+        if is_dark_mode():
+            surface, _, _ = render_page_to_surface(
+                self.doc.get_page(self.current_page),
+                scale,
+            )
+            cr.save()
+            cr.translate(ox, oy)
+            cr.set_source_surface(surface, 0, 0)
+            cr.paint()
+            cr.restore()
+        else:
+            cr.save()
+            cr.translate(ox, oy)
+            cr.scale(scale, scale)
+            cr.set_source_rgb(1.0, 1.0, 1.0)
+            cr.rectangle(0, 0, pw, ph)
+            cr.fill()
+            try:
+                self.doc.get_page(self.current_page).render(cr)
+            except (GLib.Error, RuntimeError, cairo.Error) as exc:
+                _LOGGER.warning("Poppler single-page render failed: %s", exc)
+            cr.restore()
+
+            # Subtle page border
+            cr.save()
+            cr.translate(ox, oy)
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.06)
+            cr.rectangle(0, 0, w, 1)
+            cr.fill()
+            cr.rectangle(0, h - 1, w, 1)
+            cr.fill()
+            cr.rectangle(0, 0, 1, h)
+            cr.fill()
+            cr.rectangle(w - 1, 0, 1, h)
+            cr.fill()
             cr.restore()

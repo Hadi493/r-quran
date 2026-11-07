@@ -22,6 +22,11 @@ From source:
 PYTHONPATH=src python3 -m r_quran.app
 ```
 
+## Build AppImage
+```bash
+./build-appimage.sh
+```
+
 ## Features
 - Two-page book view
 - Juz, Surah, bookmarks

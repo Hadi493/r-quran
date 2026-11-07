@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop">
+  <id>com.example.rquran</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>R-Quran</name>
+  <summary>Simple Quran reader for Linux</summary>
+  <description>
+    <p>Fast, offline Quran reader with two-page RTL book view, Juz/Surah navigation and bookmarks. Single compact topbar for Hyprland, height-fit pages, soft dark mode and fullscreen.</p>
+  </description>
+  <launchable type="desktop-id">r-quran.desktop</launchable>
+  <provides><id>r-quran.desktop</id></provides>
+  <categories>
+    <category>Education</category>
+  </categories>
+</component>
